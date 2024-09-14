@@ -1,0 +1,11 @@
+{
+	"type": "module",
+	"devDependencies": {
+		"@types/node": "^22.5.5"
+	},
+	"dependencies": {
+		"argparse": "^2.0.1",
+		"iconv-lite": "^0.6.3",
+		"luxon": "^3.5.0"
+	}
+}
