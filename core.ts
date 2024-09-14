@@ -3,6 +3,7 @@ import tls from 'tls'
 import { EventEmitter } from 'events'
 import { DateTime } from 'luxon'
 import argparse from 'argparse'
+import netrc from 'netrc'
 import { decodeHeader } from './helpers.ts'
 
 interface ArticleInfo {
@@ -18,10 +19,7 @@ interface GroupInfo {
   status: string
 }
 
-interface File {
-  write (data: string | Buffer): void
-  close (): void
-}
+interface File extends net.Socket {}
 
 class NNTP extends EventEmitter {
   private host: string
@@ -53,14 +51,15 @@ class NNTP extends EventEmitter {
     this.sock = this._createSocket(timeout)
     this.file = null
     try {
-      this.file = this.sock as unknown as File
+      this.file = this.sock
+      console.log(this.file)
       this._baseInit(readermode)
       if (user || usenetrc) {
         this.login(user, password, usenetrc)
       }
     } catch (error) {
       if (this.file) {
-        this.file.close()
+        this.file.end()
       }
       this.sock.end()
       throw error
@@ -109,7 +108,8 @@ class NNTP extends EventEmitter {
   }
 
   private _getline (): string {
-    let line = this.file?.readline() || ''
+    // TODO: Fix
+    let line = this.file?.read() || ''
     if (this.debugging > 1) {
       console.log("*get*", line)
     }
@@ -179,7 +179,7 @@ class NNTP extends EventEmitter {
       return [resp, lines]
     } finally {
       if (openedFile) {
-        openedFile.close()
+        openedFile.end()
       }
     }
   }
@@ -387,7 +387,6 @@ class NNTP extends EventEmitter {
     }
     try {
       if (usenetrc && !user) {
-        const netrc = require('netrc')
         const credentials = netrc()
         const auth = credentials.machines[this.host]
         if (auth) {
@@ -436,7 +435,7 @@ class NNTP extends EventEmitter {
   private _close (): void {
     try {
       if (this.file) {
-        this.file.close()
+        this.file.end()
         this.file = null
       }
     } finally {
@@ -570,7 +569,7 @@ class NNTP extends EventEmitter {
     }
     const resp = this._shortcmd("STARTTLS")
     if (resp.startsWith("382")) {
-      this.file?.close()
+      this.file?.end()
       this.sock = tls.connect({ host: this.host, port: this.port, secureContext: context }, () => {
         this.file = this.sock as unknown as File
         this.tls_on = true
