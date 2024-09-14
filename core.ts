@@ -73,7 +73,7 @@ class NNTP extends EventEmitter {
     this._caps = null
     this.getcapabilities()
     this.readermode_afterauth = false
-    if (readermode && !this._caps?.includes('READER')) {
+    if (readermode && !this._caps?.['READER']) {
       this._setreadermode()
       if (!this.readermode_afterauth) {
         this._caps = null
@@ -255,11 +255,11 @@ class NNTP extends EventEmitter {
   }
 
   public description (group: string): string {
-    return this._getdescriptions(group, false)
+    return this._getdescriptions(group, false) as string
   }
 
   public descriptions (group_pattern: string): [string, Record<string, string>] {
-    return this._getdescriptions(group_pattern, true)
+    return this._getdescriptions(group_pattern, true) as [string, Record<string, string>]
   }
 
   public group (name: string): [string, number, number, number, string] {
@@ -330,7 +330,7 @@ class NNTP extends EventEmitter {
   }
 
   public over (message_spec: any, file: File | null = null): [string, [number, Record<string, string>][]] {
-    let cmd = "OVER" in this._caps ? "OVER" : "XOVER"
+    let cmd = this._caps?.['OVER'] ? "OVER" : "XOVER"
     let start: number | null = null
     let end: number | null = null
     if (Array.isArray(message_spec)) {
@@ -675,14 +675,14 @@ if (require.main === module) {
     return s
   }
 
-  const firstArticle = String(parseInt(last) - args.nb_articles + 1)
-  const [, overviews] = s.xover(firstArticle, last)
+  const firstArticle = String((last | 0) - args.nb_articles + 1)
+  const [, overviews] = s.xover(parseInt(firstArticle), last)
 
   for (const [artnum, over] of overviews) {
     const author = decodeHeader(over["from"]).split("<", 1)[0]
     const subject = decodeHeader(over["subject"])
     const lines = parseInt(over[":lines"])
-    console.log(`${artnum.padStart(7)} ${cut(author, 20).padEnd(20)} ${cut(subject, 42).padEnd(42)} (${lines})`)
+    console.log(`${artnum.toString().padStart(7)} ${cut(author, 20).padEnd(20)} ${cut(subject, 42).padEnd(42)} (${lines})`)
   }
 
   s.quit()
