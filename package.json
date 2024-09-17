@@ -6,6 +6,7 @@
 	"scripts": {
 		"test": "tsx core.ts"
 	},
+	"type": "module",
 	"dependencies": {
 		"argparse": "^2.0.1",
 		"iconv-lite": "^0.6.3",
