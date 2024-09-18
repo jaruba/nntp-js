@@ -24,7 +24,7 @@ interface File extends net.Socket { }
 
 class NNTP extends EventEmitter {
   private host: string
-  private port: number
+  public port: number
   private sock: net.Socket
   private file: File | null
   private debugging: number
@@ -37,6 +37,7 @@ class NNTP extends EventEmitter {
   private nntp_implementation: string | null
   private _cachedoverviewfmt: string[] | null
   private lineReader: AsyncIterableIterator<string>
+  ready: Promise<void>
 
   constructor (
     host: string,
@@ -52,38 +53,38 @@ class NNTP extends EventEmitter {
     this.port = port
     this.sock = this._createSocket(timeout)
     this.file = null
-      ; (async () => {
-        try {
-          this.file = this.sock
-          this.lineReader = createInterface({
-            input: this.sock,
-            crlfDelay: Infinity
-          })[Symbol.asyncIterator]()
-          await this._baseInit(readermode)
-          if (user || usenetrc) {
-            this.login(user, password, usenetrc)
-          }
-        } catch (error) {
-          if (this.file) {
-            this.file.end()
-          }
-          this.sock.end()
-          throw error
+    this.ready = (async () => {
+      try {
+        this.file = this.sock
+        this.lineReader = createInterface({
+          input: this.sock,
+          crlfDelay: Infinity
+        })[Symbol.asyncIterator]()
+        await this._baseInit(readermode)
+        if (user || usenetrc) {
+          await this.login(user, password, usenetrc)
         }
-      })()
+      } catch (error) {
+        if (this.file) {
+          this.file.end()
+        }
+        this.sock.end()
+        throw error
+      }
+    })()
   }
 
   private async _baseInit (readermode: boolean | null) {
     this.debugging = 1
     this.welcome = await this._getresp()
     this._caps = null
-    this.getcapabilities()
+    await this.getcapabilities()
     this.readermode_afterauth = false
     if (readermode && !this._caps?.['READER']) {
-      this._setreadermode()
+      await this._setreadermode()
       if (!this.readermode_afterauth) {
         this._caps = null
-        this.getcapabilities()
+        await this.getcapabilities()
       }
     }
     this.tls_on = false
@@ -576,12 +577,17 @@ class NNTP extends EventEmitter {
     }
     const resp = await this._shortcmd("STARTTLS")
     if (resp.startsWith("382")) {
-      this.file?.end()
-      this.sock = tls.connect({ host: this.host, port: this.port, secureContext: context }, () => {
-        this.file = this.sock as unknown as File
-        this.tls_on = true
-        this._caps = null
-        this.getcapabilities()
+      return new Promise<void>(resolve => {
+        this.file?.end()
+        // console.log({ host: this.host, port: NNTP_SSL_PORT, secureContext: context })
+        this.sock = tls.connect({ host: this.host, port: NNTP_SSL_PORT, secureContext: context }, async () => {
+          this.file = this.sock as unknown as File
+          this.tls_on = true
+          this._caps = null
+          // console.log(this.file)
+          await this.getcapabilities()
+          resolve()
+        })
       })
     } else {
       throw new Error("TLS failed to start.")
@@ -609,7 +615,7 @@ class NNTP_SSL extends NNTP {
     this.ssl_context = ssl_context
   }
 
-  protected _create_socket (timeout: number | undefined): tls.TLSSocket {
+  protected _createSocket (timeout: number | undefined): tls.TLSSocket {
     const sock = super._createSocket(timeout)
     try {
       return new tls.TLSSocket(sock, this.ssl_context)
@@ -666,9 +672,11 @@ if (true) {
     s = new NNTP_SSL(args.server, port)
   }
 
-  const caps = s.getcapabilities()
+  await s.ready
+
+  const caps = await s.getcapabilities()
   if ("STARTTLS" in caps) {
-    s.starttls()
+    await s.starttls()
   }
 
   const [resp, count, first, last, name] = await s.group(args.group)
