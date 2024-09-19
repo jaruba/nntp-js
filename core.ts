@@ -116,7 +116,6 @@ class NNTP extends EventEmitter {
   }
 
   private async _getline (): Promise<string> {
-    // TODO: Fix
     let { value } = await this.lineReader.next()
     if (this.debugging > 1) {
       console.log("*get*", value)
@@ -421,7 +420,7 @@ class NNTP extends EventEmitter {
     }
     this._caps = null
     this.getcapabilities()
-    if (this.readermode_afterauth && !this._caps?.includes('READER')) {
+    if (this.readermode_afterauth && !this._caps?.['READER']) {
       this._setreadermode()
       this._caps = null
       this.getcapabilities()
@@ -564,7 +563,6 @@ class NNTP extends EventEmitter {
       this.file?.write(lineStr)
     }
     this.file?.write('.\r\n')
-    this.file?.flush()
     return await this._getresp()
   }
 
@@ -577,18 +575,19 @@ class NNTP extends EventEmitter {
     }
     const resp = await this._shortcmd("STARTTLS")
     if (resp.startsWith("382")) {
-      return new Promise<void>(resolve => {
-        this.file?.end()
-        // console.log({ host: this.host, port: NNTP_SSL_PORT, secureContext: context })
-        this.sock = tls.connect({ host: this.host, port: NNTP_SSL_PORT, secureContext: context }, async () => {
-          this.file = this.sock as unknown as File
-          this.tls_on = true
-          this._caps = null
-          // console.log(this.file)
-          await this.getcapabilities()
+      // console.log({ host: this.host, port: NNTP_SSL_PORT, secureContext: context })
+      await new Promise<void>((resolve, reject) => {
+        this.file = this.sock = tls.connect(5000, this.host, { socket: this.sock }, () => {
           resolve()
         })
       })
+      this.lineReader = createInterface({
+        input: this.sock,
+        crlfDelay: Infinity
+      })[Symbol.asyncIterator]()
+      this.tls_on = true
+      this._caps = null
+      await this.getcapabilities()
     } else {
       throw new Error("TLS failed to start.")
     }
@@ -693,9 +692,9 @@ if (true) {
   const [, overviews] = await s.xover(parseInt(firstArticle), last)
 
   for (const [artnum, over] of overviews) {
-    const author = decodeHeader(over["from"]).split("<", 1)[0]
-    const subject = decodeHeader(over["subject"])
-    const lines = parseInt(over[":lines"])
+    const author = decodeHeader(over["From:"]).split("<", 1)[0]
+    const subject = decodeHeader(over["Subject:"])
+    const lines = parseInt(over["Lines:"])
     console.log(`${artnum.toString().padStart(7)} ${cut(author, 20).padEnd(20)} ${cut(subject, 42).padEnd(42)} (${lines})`)
   }
 
