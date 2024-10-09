@@ -1,45 +1,44 @@
-// Exceptions raised when an error or invalid response is received
 export class NNTPError extends Error {
   response: string
 
   constructor (...args: string[]) {
     super(...args)
-    this.name = "NNTPError"
-    this.response = args[0] || "No response given"
+    this.name = 'NNTPError'
+    this.response = args[0] || 'No response given'
   }
 }
 
 export class NNTPReplyError extends NNTPError {
   constructor (...args: string[]) {
     super(...args)
-    this.name = "NNTPReplyError"
+    this.name = 'NNTPReplyError'
   }
 }
 
 export class NNTPTemporaryError extends NNTPError {
   constructor (...args: string[]) {
     super(...args)
-    this.name = "NNTPTemporaryError"
+    this.name = 'NNTPTemporaryError'
   }
 }
 
 export class NNTPPermanentError extends NNTPError {
   constructor (...args: string[]) {
     super(...args)
-    this.name = "NNTPPermanentError"
+    this.name = 'NNTPPermanentError'
   }
 }
 
 export class NNTPProtocolError extends NNTPError {
   constructor (...args: string[]) {
     super(...args)
-    this.name = "NNTPProtocolError"
+    this.name = 'NNTPProtocolError'
   }
 }
 
 export class NNTPDataError extends NNTPError {
   constructor (...args: string[]) {
     super(...args)
-    this.name = "NNTPDataError"
+    this.name = 'NNTPDataError'
   }
 }
