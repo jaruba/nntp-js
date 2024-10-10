@@ -1,15 +1,42 @@
 import net from 'node:net'
 import tls from 'node:tls'
-import { createInterface } from 'node:readline'
 import { EventEmitter } from 'events'
 import { formatDate, parseDateString, parseHeaders, parseOverview, parseOverviewFmt } from './helpers.ts'
 import { NNTPDataError, NNTPPermanentError, NNTPProtocolError, NNTPReplyError, NNTPTemporaryError } from './exceptions.ts'
-import { DEFAULT_OVERVIEW_FMT, LONGRESP } from './constants.ts'
+import { LONGRESP_END, DEFAULT_OVERVIEW_FMT, NEW_LINE, HEADERS_END } from './constants.ts'
 
-interface ArticleInfo {
-  artNum: number
-  messageId: string
-  lines: string[]
+async function * findByteSequence (sourceIterator: AsyncIterable<Uint8Array>, targetSequence: Uint8Array) {
+  // not great but good enough
+  const buffer = []
+  let targetLength = targetSequence.length
+  let matchIndex = 0
+
+  for await (const chunk of sourceIterator) {
+    for (const byte of chunk) {
+      buffer.push(byte)
+      if (byte === targetSequence[matchIndex]) {
+        matchIndex++
+        if (matchIndex === targetLength) {
+          // Sequence found, yield all data up to but not including the sequence
+          if (buffer.length > 0) {
+            targetSequence = yield new Uint8Array(buffer.slice(0, -targetLength)) || targetSequence
+          }
+          buffer.length = 0 // Clear the buffer
+          matchIndex = 0
+          targetLength = targetSequence.length
+        }
+      } else {
+        matchIndex = (byte === targetSequence[0]) ? 1 : 0
+      }
+    }
+  }
+
+  if (buffer.length > 0) yield new Uint8Array(buffer)
+}
+
+const decoder = new TextDecoder('ascii')
+function decode (data: Uint8Array) {
+  return decoder.decode(data)
 }
 
 export class NNTP extends EventEmitter {
@@ -17,14 +44,14 @@ export class NNTP extends EventEmitter {
   port
   sock?: net.Socket
   welcome?: string
-  _caps?: Record<string, string[]>
+  caps?: Record<string, string[]>
   readermodeAfterauth?: boolean
   tlsOn = false
   authenticated = false
   nntpVersion?: number
   nntpImplementation?: string
   _cachedoverviewfmt?: string[]
-  lineReader?: AsyncIterableIterator<string>
+  byteReader?: AsyncGenerator<Uint8Array, void, Uint8Array>
   connected = false
 
   constructor (host: string, port = 119, readermode = false, timeout?: number) {
@@ -36,23 +63,19 @@ export class NNTP extends EventEmitter {
   async connect (readermode = false, timeout: number | undefined = undefined, socket?: net.Socket) {
     try {
       this.sock = socket || this._createSocket(timeout)
-      this.lineReader = createInterface({
-        input: this.sock,
-        crlfDelay: Infinity
-
-      })[Symbol.asyncIterator]()
-      this.welcome = await this._getresp()
-      this._caps = undefined
+      this.byteReader = findByteSequence(this.sock, NEW_LINE) // initialize with new line since first requet is always a welcome single line
+      this.welcome = decode(await this._getresp())
+      this.caps = undefined
+      this.connected = true
       await this.getcapabilities()
       this.readermodeAfterauth = false
-      if (readermode && !this._caps!?.READER) {
+      if (readermode && !this.caps!?.READER) {
         await this._setreadermode()
         if (!this.readermodeAfterauth) {
-          this._caps = undefined
+          this.caps = undefined
           await this.getcapabilities()
         }
       }
-      this.connected = true
     } catch (error) {
       this.sock?.end()
       throw error
@@ -70,25 +93,22 @@ export class NNTP extends EventEmitter {
     return net.createConnection({ host: this.host, port: this.port, timeout })
   }
 
-  async _getresp (): Promise<string> {
-    const resp = await this._getline()
-    if (resp.startsWith('4')) {
-      throw new NNTPTemporaryError(resp)
+  async _getresp (delimiter = NEW_LINE) {
+    const resp = await this._getline(delimiter)
+    if (resp[0] === 52 || resp[0] === 53) { // 4xx, 5xx
+      throw new NNTPTemporaryError(decode(resp))
     }
-    if (resp.startsWith('5')) {
-      throw new NNTPPermanentError(resp)
-    }
-    if (!resp.startsWith('1') && !resp.startsWith('2') && !resp.startsWith('3')) {
-      throw new NNTPProtocolError(resp)
+    if (resp[0] !== 49 && resp[0] !== 50 && resp[0] !== 51) { // 1xx, 2xx, 3xx
+      throw new NNTPProtocolError(decode(resp))
     }
     return resp
   }
 
-  async _getline (): Promise<string> {
-    const { value } = await this.lineReader!.next()
+  async _getline (delimiter = NEW_LINE) {
+    const { value } = await this.byteReader!.next(delimiter)
     if (value === undefined) throw new Error('End of stream')
 
-    return value.trim()
+    return value
   }
 
   _putline (line: string) {
@@ -96,38 +116,18 @@ export class NNTP extends EventEmitter {
     this.sock!.write(line + '\r\n')
   }
 
-  _putcmd (line: string) {
-    this._putline(line)
-  }
-
   _shortcmd (line: string) {
-    this._putcmd(line)
+    this._putline(line)
     return this._getresp()
   }
 
-  _longcmd (line: string): Promise<[string, string[]]> {
-    this._putcmd(line)
+  _longcmd (line: string) {
+    this._putline(line)
     return this._getlongresp()
   }
 
-  async _getlongresp (): Promise<[string, string[]]> {
-    const resp = await this._getresp()
-    if (!LONGRESP.has(resp.slice(0, 3))) throw new NNTPReplyError(resp)
-    const lines: string[] = []
-
-    const terminator = '.'
-    while (true) {
-      let line = await this._getline()
-      if (line === terminator) {
-        break
-      }
-      if (line.startsWith('..')) {
-        line = line.substring(1)
-      }
-      lines.push(line)
-    }
-
-    return [resp, lines]
+  async _getlongresp () {
+    return { resp: decode(await this._getresp()), data: await this._getline(LONGRESP_END) }
   }
 
   getwelcome (): string {
@@ -135,12 +135,12 @@ export class NNTP extends EventEmitter {
   }
 
   async getcapabilities () {
-    if (this._caps === undefined) {
+    if (this.caps === undefined) {
       this.nntpVersion = 1
       this.nntpImplementation = undefined
       try {
-        const [, caps] = await this.capabilities()
-        this._caps = caps
+        const { caps } = await this.capabilities()
+        this.caps = caps
         if (caps.VERSION) {
           this.nntpVersion = Math.max(...caps.VERSION.map(Number))
         }
@@ -148,20 +148,20 @@ export class NNTP extends EventEmitter {
           this.nntpImplementation = caps.IMPLEMENTATION.join(' ')
         }
       } catch (error) {
-        this._caps = {}
+        this.caps = {}
       }
     }
-    return this._caps
+    return this.caps
   }
 
-  async capabilities (): Promise<[string, Record<string, string[]>]> {
+  async capabilities () {
     const caps: Record<string, string[]> = {}
-    const [resp, lines] = await this._longcmdstring('CAPABILITIES')
-    for (const line of lines) {
+    const { resp, data } = await this._longcmd('CAPABILITIES')
+    for (const line of decode(data).split('\r\n')) {
       const [name, ...tokens] = line.split(' ')
       caps[name] = tokens
     }
-    return [resp, caps]
+    return { resp, caps }
   }
 
   newgroups (date: Date) {
@@ -169,7 +169,7 @@ export class NNTP extends EventEmitter {
       throw new TypeError('the date parameter must be a Date object')
     }
 
-    return this._longcmdstring(`NEWGROUPS ${formatDate(date, 'yyyyMMdd')} ${formatDate(date, 'HHmmss')}`)
+    return this._longcmd(`NEWGROUPS ${formatDate(date, 'yyyyMMdd')} ${formatDate(date, 'HHmmss')}`)
   }
 
   newnews (group: string, date: Date) {
@@ -177,12 +177,11 @@ export class NNTP extends EventEmitter {
       throw new TypeError('the date parameter must be a Date object')
     }
 
-    return this._longcmdstring(`NEWNEWS ${group} ${formatDate(date, 'yyyyMMdd')} ${formatDate(date, 'HHmmss')}`)
+    return this._longcmd(`NEWNEWS ${group} ${formatDate(date, 'yyyyMMdd')} ${formatDate(date, 'HHmmss')}`)
   }
 
-  list (groupPattern: string | null = null) {
-    const command = groupPattern ? `LIST ACTIVE ${groupPattern}` : 'LIST'
-    return this._longcmdstring(command)
+  list (groupPattern?: string | number) {
+    return this._longcmd(groupPattern ? `LIST ACTIVE ${groupPattern}` : 'LIST')
   }
 
   async description (group: string) {
@@ -193,24 +192,20 @@ export class NNTP extends EventEmitter {
     return await this._getdescriptions(groupPattern, true) as [string, Record<string, string>]
   }
 
-  async group (name: string): Promise<[string, number, number, number, string]> {
-    const resp = await this._shortcmd(`GROUP ${name}`)
+  async group (name: string) {
+    const resp = decode(await this._shortcmd(`GROUP ${name}`))
     if (!resp.startsWith('211')) {
       throw new NNTPReplyError(resp)
     }
-    const words = resp.split(' ')
-    const count = parseInt(words[1], 10)
-    const first = parseInt(words[2], 10)
-    const last = parseInt(words[3], 10)
-    const groupName = words[4].toLowerCase()
-    return [resp, count, first, last, groupName]
+    const [count, first, last, group] = resp.split(' ')
+    return { resp, count, first, last, group }
   }
 
   help () {
-    return this._longcmdstring('HELP')
+    return this._longcmd('HELP')
   }
 
-  stat (messageSpec: string = '') {
+  stat (messageSpec?: string) {
     if (messageSpec) {
       return this._statcmd(`STAT ${messageSpec}`)
     } else {
@@ -227,73 +222,61 @@ export class NNTP extends EventEmitter {
   }
 
   /** get article head  */
-  async head (messageSpec: number) {
-    const cmd = messageSpec ? `HEAD ${messageSpec}` : 'HEAD'
-    const [resp, art] = await this._artcmd(cmd)
-    return [resp, parseHeaders(art.lines)]
+  async head (messageSpec?: string | number) {
+    const { resp, data } = await this._artcmd(messageSpec ? `HEAD ${messageSpec}` : 'HEAD')
+    return { resp, headers: parseHeaders(decode(data).split('\r\n')) }
   }
 
   /** get article body  */
-  async body (messageSpec: number) {
-    const cmd = messageSpec ? `BODY ${messageSpec}` : 'BODY'
-    const [resp, art] = await this._artcmd(cmd)
-    return [resp, art.lines.join()]
+  async body (messageSpec?: string | number) {
+    return await this._artcmd(messageSpec ? `BODY ${messageSpec}` : 'BODY')
   }
 
   /** get article head and body  */
-  async article (messageSpec?: number) {
-    const cmd = messageSpec ? `ARTICLE ${messageSpec}` : 'ARTICLE'
-    const [resp, art] = await this._artcmd(cmd)
-    const lines: string[] = []
-    let headers: Headers | undefined
-    for (const line of art.lines) {
-      if (!headers && line === '') {
-        headers = parseHeaders(lines)
-        lines.length = 0
-      } else {
-        lines.push(line)
-      }
-    }
+  async article (messageSpec?: string | number) {
+    this._putline(messageSpec ? `ARTICLE ${messageSpec}` : 'ARTICLE')
+    const resp = decode(await this._getresp())
+    const headers = parseHeaders(decode(await this._getline(HEADERS_END)).split('\r\n'))
+    const data = await this._getline(LONGRESP_END)
 
-    return [resp, { headers, body: lines.join('\r\n') }]
+    return { resp, res: new Response(data, { headers }) }
   }
 
   slave () {
     return this._shortcmd('SLAVE')
   }
 
-  async xhdr (hdr: string, str: any): Promise<[string, string[]]> {
-    const pat = /^([0-9]+) ?(.*)\n?/
-    const [resp, lines] = await this._longcmdstring(`XHDR ${hdr} ${str}`)
-    return [resp, lines.map(line => {
-      const match = pat.exec(line)
-      return match ? match[1] : line
-    })]
+  async xhdr (hdr: string, str: any) {
+    const { resp, data } = await this._longcmd(`XHDR ${hdr} ${str}`)
+    return {
+      resp,
+      hdr: decode(data).split('\r\n').map(line => {
+        const match = /^([0-9]+) ?(.*)\n?/.exec(line)
+        return match ? match[1] : line
+      })
+    }
   }
 
-  async xover (start: number, end: number): Promise<[string, [number, Record<string, string>][]]> {
-    const [resp, lines] = await this._longcmdstring(`XOVER ${start}-${end}`)
-    const fmt = await this._getoverviewfmt()
-    return [resp, parseOverview(lines, fmt)]
+  async xover (start: string | number, end: string | number) {
+    const { resp, data } = await this._longcmd(`XOVER ${start}-${end}`)
+    return { resp, overviews: parseOverview(decode(data).split('\r\n'), await this._getoverviewfmt()) }
   }
 
-  async over (messageSpec: any): Promise<[string, [number, Record<string, string>][]]> {
-    let cmd = this._caps?.OVER ? 'OVER' : 'XOVER'
-    let start: number | null = null
-    let end: number | null = null
+  async over (messageSpec: [string | number, string | number] | number | string) {
+    let cmd = this.caps?.OVER ? 'OVER' : 'XOVER'
     if (Array.isArray(messageSpec)) {
-      [start, end] = messageSpec
+      const [start, end] = messageSpec
       cmd += ` ${start}-${end || ''}`
-    } else if (messageSpec !== null) {
+    } else if (messageSpec != null) {
       cmd += ` ${messageSpec}`
     }
-    const [resp, lines] = await this._longcmdstring(cmd)
+    const { resp, data } = await this._longcmd(cmd)
     const fmt = await this._getoverviewfmt()
-    return [resp, parseOverview(lines, fmt)]
+    return { resp, overview: parseOverview(decode(data).split('\r\n'), fmt) }
   }
 
-  async date (): Promise<[string, Date]> {
-    const resp = await this._shortcmd('DATE')
+  async date () {
+    const resp = decode(await this._shortcmd('DATE'))
     if (!resp.startsWith('111')) {
       throw new NNTPReplyError(resp)
     }
@@ -305,22 +288,20 @@ export class NNTP extends EventEmitter {
     if (date.length !== 14) {
       throw new NNTPDataError(resp)
     }
-    return [resp, parseDateString(date)]
+    return { resp, date: parseDateString(date) }
   }
 
-  post (data: Buffer | Iterable<Buffer>) {
+  post (data: Iterable<Buffer>) {
     return this._post('POST', data)
   }
 
-  ihave (messageId: any, data: Buffer | Iterable<Buffer>) {
+  ihave (messageId: any, data: Iterable<Buffer>) {
     return this._post(`IHAVE ${messageId}`, data)
   }
 
   async quit () {
     try {
-      const resp = await this._shortcmd('QUIT')
-      this._close()
-      return resp
+      return await this._shortcmd('QUIT')
     } finally {
       this._close()
     }
@@ -334,29 +315,29 @@ export class NNTP extends EventEmitter {
       throw new Error('`user` must be specified')
     }
 
-    let resp = await this._shortcmd(`authinfo user ${user}`)
+    const resp = decode(await this._shortcmd(`authinfo user ${user}`))
     if (resp.startsWith('381')) {
       if (!password) {
         throw new NNTPReplyError(resp)
       } else {
-        resp = await this._shortcmd(`authinfo pass ${password}`)
+        const resp = decode(await this._shortcmd(`authinfo pass ${password}`))
         if (!resp.startsWith('281')) {
           throw new NNTPPermanentError(resp)
         }
       }
     }
-    this._caps = undefined
-    this.getcapabilities()
-    if (this.readermodeAfterauth && !this._caps!?.READER) {
-      this._setreadermode()
-      this._caps = undefined
-      this.getcapabilities()
+    this.caps = undefined
+    await this.getcapabilities()
+    if (this.readermodeAfterauth && !this.caps!?.READER) {
+      await this._setreadermode()
+      this.caps = undefined
+      await this.getcapabilities()
     }
   }
 
   async _setreadermode () {
     try {
-      this.welcome = await this._shortcmd('mode reader')
+      this.welcome = decode(await this._shortcmd('mode reader'))
     } catch (error) {
       if ((error as Error).message.startsWith('480')) {
         this.readermodeAfterauth = true
@@ -370,36 +351,33 @@ export class NNTP extends EventEmitter {
     this.sock!.end()
   }
 
-  _statparse (resp: string): [string, number, string] {
+  _statparse (resp: string) {
     if (!resp.startsWith('22')) {
       throw new NNTPReplyError(resp)
     }
     const words = resp.split(' ')
-    const artNum = parseInt(words[1], 10)
+    const artNum = parseInt(words[1])
     const messageId = words[2]
-    return [resp, artNum, messageId]
+    return { resp, artNum, messageId }
   }
 
   async _statcmd (line: string) {
-    const resp = await this._shortcmd(line)
-    return this._statparse(resp)
+    return this._statparse(decode(await this._shortcmd(line)))
   }
 
-  async _artcmd (line: string): Promise<[string, ArticleInfo]> {
-    const [resp, lines] = await this._longcmd(line)
-    const [, artNum, messageId] = this._statparse(resp)
-    return [resp, { artNum, messageId, lines }]
+  async _artcmd (line: string) {
+    const { resp, data } = await this._longcmd(line)
+    const { artNum, messageId } = this._statparse(resp)
+    return { resp, artNum, messageId, data }
   }
 
   async _getoverviewfmt () {
-    if (this._cachedoverviewfmt) {
-      return this._cachedoverviewfmt
-    }
+    if (this._cachedoverviewfmt) return this._cachedoverviewfmt
 
     let fmt = []
     try {
-      const [, lines] = await this._longcmdstring('LIST OVERVIEW.FMT')
-      fmt = lines
+      const { data } = await this._longcmd('LIST OVERVIEW.FMT')
+      fmt = decode(data).split('\r\n')
     } catch (error) {
       fmt = DEFAULT_OVERVIEW_FMT
     }
@@ -407,26 +385,22 @@ export class NNTP extends EventEmitter {
     return this._cachedoverviewfmt
   }
 
-  async _longcmdstring (line: string): Promise<[string, string[]]> {
-    const [resp, lines] = await this._longcmd(line)
-    return [resp, lines]
-  }
-
   async _getdescriptions (groupPattern: string, returnAll: boolean): Promise<string | [string, Record<string, string>]> {
     const linePat = /^(?<group>[^ \t]+)[ \t]+(.*)$/
-    const [resp, lines] = await this._longcmdstring(`LIST NEWSGROUPS ${groupPattern}`)
+    const { resp, data } = await this._longcmd(`LIST NEWSGROUPS ${groupPattern}`)
+    const lines = decode(data).split('\r\n')
     if (!resp.startsWith('215')) {
-      const [resp2, lines2] = await this._longcmdstring(`XGTITLE ${groupPattern}`)
+      const { resp, data } = await this._longcmd(`XGTITLE ${groupPattern}`)
       if (returnAll) {
         const groups: Record<string, string> = {}
-        for (const rawLine of lines2) {
+        for (const rawLine of decode(data).split('\r\n')) {
           const match = linePat.exec(rawLine.trim())
           if (match) {
             const [, name, desc] = match
             groups[name] = desc
           }
         }
-        return [resp2, groups]
+        return [resp, groups]
       } else {
         return ''
       }
@@ -452,22 +426,15 @@ export class NNTP extends EventEmitter {
     }
   }
 
-  async _post (command: string, data: Buffer | Iterable<Buffer>) {
-    const resp = await this._shortcmd(command)
+  async _post (command: string, data: Iterable<Buffer>) {
+    const resp = decode(await this._shortcmd(command))
     if (!resp.startsWith('3')) {
       throw new NNTPReplyError(resp)
     }
-    if (data instanceof Buffer) {
-      data = [data]
-    }
     for (const line of data) {
       let lineStr = line.toString()
-      if (!lineStr.endsWith('\r\n')) {
-        lineStr += '\r\n'
-      }
-      if (lineStr.startsWith('.')) {
-        lineStr = '.' + lineStr
-      }
+      if (!lineStr.endsWith('\r\n')) lineStr += '\r\n'
+      if (lineStr.startsWith('.')) lineStr = '.' + lineStr
       this.sock!.write(lineStr)
     }
     this.sock!.write('.\r\n')
@@ -481,17 +448,16 @@ export class NNTP extends EventEmitter {
     if (this.authenticated) {
       throw new Error('TLS cannot be started after authentication.')
     }
-    const resp = await this._shortcmd('STARTTLS')
+    const resp = decode(await this._shortcmd('STARTTLS'))
     if (resp.startsWith('382')) {
       this.connected = false
-      await new Promise<void>((resolve, reject) => {
-        this.sock = tls.connect(5000, this.host, { socket: this.sock, secureContext }, () => {
-          resolve()
-        })
+      await new Promise<void>(resolve => {
+        this.sock = tls.connect(5000, this.host, { socket: this.sock, secureContext }, resolve)
+        this.byteReader = findByteSequence(this.sock, NEW_LINE)
       })
       this.connected = true
       this.tlsOn = true
-      this._caps = undefined
+      this.caps = undefined
       await this.getcapabilities()
     } else {
       throw new Error('TLS failed to start.')

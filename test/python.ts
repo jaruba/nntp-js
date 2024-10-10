@@ -11,8 +11,8 @@ if ('STARTTLS' in caps) {
   await s.starttls()
 }
 
-const [, count, first, last, name] = await s.group('gmane.comp.python.general')
-console.log('Group', name, 'has', count, 'articles, range', first, 'to', last)
+const { count, first, last, group } = await s.group('gmane.comp.python.general')
+console.log('Group', group, 'has', count, 'articles, range', first, 'to', last)
 
 function cut (s: string, lim: number): string {
   if (s.length > lim) {
@@ -21,8 +21,8 @@ function cut (s: string, lim: number): string {
   return s
 }
 
-const firstArticle = String((last | 0) - 10 + 1)
-const [, overviews] = await s.xover(parseInt(firstArticle), last)
+const firstArticle = (Number(last) | 0) - 10 + 1
+const { overviews } = await s.xover(firstArticle, last)
 
 for (const [artnum, over] of overviews) {
   const author = over.from.split('<', 1)[0]
