@@ -10,5 +10,7 @@
     "noEmit": true,
     "noImplicitAny": true,
     "strict": true,
+    "types": ["node"]
   },
+  "exclude": ["node_modules", "dist"],
 }
